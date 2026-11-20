@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+import time
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
@@ -14,7 +15,10 @@ def _get_client():
     """Create the Claude client only when it is needed (demo mode never needs it)."""
     global _client
     if _client is None:
-        _client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+        _client = anthropic.Anthropic(
+            timeout=_config_int("AI_TIMEOUT_SECONDS", 35),
+            max_retries=0,  # avoid hidden SDK retries causing long waits
+        )  # reads ANTHROPIC_API_KEY from the environment
     return _client
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -125,6 +129,12 @@ Rules:
    Use null if unidentified. Never guess between legal entities.
 
 3. CATEGORY: Choose the exact name from the allowed categories.
+   "address update", "change address", "update company address" indicate
+   an address-change task: select "Change of Registered Address" if the
+   context is the company's registered address, or "Change of Business
+   Address" if explicitly a business/operating address. If unspecified,
+   choose "Change of Registered Address" provisionally and let staff confirm.
+   Never use "Others" for a recognisable address-change request.
    If none fits, use "Others" if available, otherwise null.
    Suggest a specific new category when using Others/null.
    Never create or approve categories automatically.
@@ -137,7 +147,9 @@ Rules:
 5. FEE: Extract RM/MYR amounts associated with each service, including
    shorthand like "Annual Return - RM500" or "Resolution: RM250".
    Do not require fee/charge/payment keywords. Keep amounts with
-   their respective tasks. Exclude share capital, quantities,
+   their respective tasks. If an amount occurs in a particular task's
+   excerpt, do not leave that task's fee_amount null. NEVER spread one
+   shared amount across all tasks. Exclude share capital, quantities,
    transaction values and unrelated amounts. If absent or ambiguous,
    null (never assume 0).
 
@@ -156,20 +168,28 @@ Known companies:
 
 
 def _build_system(categories, companies, today, message=""):
-    # Existing client directories may become large; cap the transmitted list.
-    max_companies = _config_int("MAX_PROMPT_COMPANIES", 200)
-    all_companies = list(companies or [])
-    simplified_message = re.sub(r"[^a-z0-9]", "", message.casefold())
-    matched = [c for c in all_companies
-               if re.sub(r"[^a-z0-9]", "", c.casefold()) in simplified_message]
-    companies = (matched + [c for c in all_companies if c not in matched])[:max_companies]
-    return (
-        SYSTEM_TEMPLATE
-        .replace("<<TODAY>>", today)
-        .replace("<<YEAR>>", today[:4])
-        .replace("<<CATEGORIES>>", "\n".join(f"- {c}" for c in categories))
-        .replace("<<COMPANIES>>", "\n".join(f"- {c}" for c in companies) or "(none yet)")
-    )
+    """Only send company names relevant to the message, not the full directory.
+
+    Exact-name and unique abbreviated-name resolution remains on the app side.
+    This avoids exposing unrelated company names to the AI and reduces tokens.
+    """
+    max_companies = _config_int("MAX_PROMPT_COMPANIES", 30)
+    text_norm = re.sub(r"[^a-z0-9]", "", message.casefold())
+    choices = []
+    for c in companies or ():
+        company_norm = re.sub(r"[^a-z0-9]", "", c.casefold())
+        base_norm = re.sub(r"(?:sdnbhd|berhad|bhd)$", "", company_norm)
+        # Require the distinctive name to be at least 4 characters before
+        # using an abbreviated company match.
+        if company_norm in text_norm or (len(base_norm) >= 4 and base_norm in text_norm):
+            choices.append(c)
+            if len(choices) >= max_companies:
+                break
+    return (SYSTEM_TEMPLATE
+            .replace("<<TODAY>>", today)
+            .replace("<<CATEGORIES>>", "\n".join(f"- {c}" for c in categories))
+            .replace("<<COMPANIES>>", "\n".join(f"- {c}" for c in choices)
+                     or "(no matching names; preserve the company name as written)"))
 
 
 def _parse_json(text):
@@ -207,6 +227,64 @@ def _clean_fee(value):
         return number if math.isfinite(number) and number >= 0 else None
     except (ValueError, TypeError):
         return None
+
+
+# Conservative post-processing for obvious extraction misses. Runs locally with
+# no extra AI request. Always leave ambiguous amount assignments for review.
+_AMOUNT = re.compile(r"\b(?:RM|MYR)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b", re.I)
+_ADDRESS = re.compile(r"\b(?:address\s+(?:update|change|amendment)|(?:update|change|amend)\s+(?:(?:the|company|registered|business)\s+){0,3}address)\b", re.I)
+_BUSINESS_ADDRESS = re.compile(r"\b(?:business|operating|office)\s+address\b", re.I)
+_EXCLUDED_MONEY = re.compile(r"\b(?:share\s+capital|paid[- ]up\s+capital|purchase\s+price|transaction\s+value|property\s+value|loan\s+amount)\b", re.I)
+
+
+def _amounts_in(text):
+    return [float(m.group(1).replace(",", "")) for m in _AMOUNT.finditer(text or "")]
+
+
+def _repair_obvious_fields(result, message, categories):
+    """Repair clear address/fee omissions, without guessing a shared fee.
+
+    A numeric amount is assigned only when it appears in the task's own
+    original excerpt, or when the entire instruction contains ONE task and
+    ONE amount. Otherwise missing fee values remain null for staff review.
+    """
+    tasks = result.get("tasks", [])
+    available = set(categories)
+    for task in tasks:
+        excerpt = task.get("source_text") or ""
+        category = task.get("category")
+        if category in (None, "Others") and _ADDRESS.search(excerpt):
+            choice = ("Change of Business Address" if _BUSINESS_ADDRESS.search(excerpt)
+                      else "Change of Registered Address")
+            if choice in available:
+                task["category"] = choice
+                task["suggested_category"] = None
+                task["missing"] = [m for m in task.get("missing", []) if m != "category"]
+        # A fee already extracted by the AI is preserved.
+        if task.get("fee_amount") is not None:
+            continue
+        if _EXCLUDED_MONEY.search(excerpt):
+            continue
+        amounts = _amounts_in(excerpt)
+        if len(amounts) == 1:
+            task["fee_amount"] = amounts[0]
+        elif len(tasks) == 1 and not amounts and not _EXCLUDED_MONEY.search(message):
+            whole = _amounts_in(message)
+            if len(whole) == 1:
+                task["fee_amount"] = whole[0]
+    # When the model attaches a fee to the wrong task, resolve only if a
+    # different task has the same fee explicitly in its own excerpt.
+    if len(tasks) > 1:
+        for task in tasks:
+            fee = task.get("fee_amount")
+            if fee is not None and fee not in _amounts_in(task.get("source_text") or ""):
+                owners = [other for other in tasks if other is not task and
+                          fee in _amounts_in(other.get("source_text") or "")]
+                if len(owners) == 1:
+                    task["fee_amount"] = None
+                    if owners[0].get("fee_amount") is None:
+                        owners[0]["fee_amount"] = fee
+    return result
 
 
 def _clean(result, categories):
@@ -433,6 +511,104 @@ def _demo_extract(message, categories, today_text, known_companies=()):
     intent = "update" if re.search(r"\bupdate\b[^.]*\btask\b", message, re.I) else "new_task"
     return {"intent": intent if tasks else "unknown", "tasks": tasks}
 
+def extract_fee(message):
+    matches = re.findall(
+        r"\b(?:RM|MYR)\s*([\d,]+(?:\.\d{1,2})?)",
+        message,
+        flags=re.IGNORECASE
+    )
+    if len(matches) == 1:
+        return float(matches[0].replace(",", ""))
+    return None
+
+# ---------- Optional instant path for simple messages (NO network/API) ----------
+# FAST_MODE=local_first: local parser for clear cases, AI for ambiguous cases.
+# FAST_MODE=local_only: never call remote AI; unknown cases need human review.
+# FAST_MODE=ai_only: always use remote AI (original behaviour).
+def _fast_company(message, known_companies):
+    """Require one unambiguous registered company reference or 'X company asked...'."""
+    def norm(v):
+        return re.sub(r'[^a-z0-9]', '', str(v).casefold())
+    msg = norm(message)
+    matches = []
+    for company in known_companies or ():
+        full = norm(company)
+        root = re.sub(r'(?:sdnbhd|berhad|bhd)$', '', full)
+        if full and full in msg or len(root) >= 5 and root in msg:
+            matches.append(company)
+    matches = list(dict.fromkeys(matches))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return None
+    literal = _COMPANY.search(message)
+    if literal:
+        return _clean_company(literal.group(1))
+    m = re.match(r'^\s*([A-Za-z][A-Za-z\d& .-]{2,70}?)\s+company\s+(?:asked|requested|needs?|wants?)\b', message, re.I)
+    return m.group(1).strip() if m else None
+
+
+def _fast_category(text, categories):
+    choices = set(categories)
+    if _ADDRESS.search(text):
+        value = 'Change of Business Address' if _BUSINESS_ADDRESS.search(text) else 'Change of Registered Address'
+        return value if value in choices else None
+    patterns = (
+        (r'\bannual\s+return\b', 'Annual Return'),
+        (r'\b(?:change|appoint|resign|remove|replacement)\b.{0,30}\bdirectors?\b|\bdirectors?\s+(?:change|appointment|resignation)\b', 'Change of Directors'),
+        (r'\b(?:board\s+)?resolutions?\b', 'Board Resolutions'),
+        (r'\bshare\s+transfer\b', 'Share Transfer'),
+        (r'\bfinancial\s+statements?\b', 'Financial Statements'),
+        (r'\b(?:incorporate|incorporation)\b', 'Company Incorporation'),
+        (r'\b(?:kyc|due\s+diligence)\b', 'KYC / Client Due Diligence'),
+    )
+    found = [c for p,c in patterns if re.search(p, text, re.I) and c in choices]
+    return found[0] if len(set(found)) == 1 else None
+
+
+def _fast_local(message, categories, companies, today):
+    """Parse well-defined *short* instructions; return None to fall back to AI.
+
+    Never silently spread one price over multiple tasks. Unclear wording is
+    represented as Others requiring review, not a guessed service.
+    """
+    if len(message) > 320 or '\n' in message or ';' in message or re.search(r'\b(?:update (?:the|existing|task)|change status|already completed|cancel)\b', message, re.I):
+        return None
+    company = _fast_company(message, companies)
+    if not company:
+        return None
+    chunks = [message]
+    # Split only an explicit two-service phrase; generic 'and' is too risky.
+    split = re.search(r'\b(financial place)\s+and\s+(address\s+(?:update|change))\b', message, re.I)
+    if split:
+        chunks = [split.group(1), message[split.start(2):]]
+    elif re.search(r'\band\b', message, re.I):
+        return None
+    received = _find_date(message, date.fromisoformat(today))
+    fees = _amounts_in(message)
+    if len(fees) > 1:
+        return None
+    tasks = []
+    for i, chunk in enumerate(chunks):
+        cat = _fast_category(chunk, categories)
+        if cat is None:
+            if len(chunks) == 1:
+                return None
+            cat = 'Others' if 'Others' in categories else None
+        fee = _amounts_in(chunk)
+        # Only attribute a shared amount when exactly one task exists.
+        if len(chunks) == 1 and not fee and len(fees) == 1 and not _EXCLUDED_MONEY.search(message):
+            fee = fees
+        if _EXCLUDED_MONEY.search(chunk):
+            fee = []
+        task = dict(company=company, category=cat,
+                    suggested_category=None, date_received=received,
+                    fee_amount=fee[0] if len(fee) == 1 else None,
+                    source_text=chunk.strip(),
+                    missing=(["category"] if cat is None else []) + (["date_received"] if received is None else []))
+        tasks.append(task)
+    return {'intent':'new_task', 'tasks':tasks, 'extraction_method':'local', 'latency_seconds':0.0}
+
 
 def extract_tasks(message, categories, companies, today):
     """Return the same task dictionary expected by the Excel app.
@@ -447,20 +623,36 @@ def extract_tasks(message, categories, companies, today):
     if len(message) > limit:
         raise ValueError(f"Message is {len(message):,} characters (limit {limit:,}). Split it into smaller parts.")
 
+    mode = os.getenv("FAST_MODE", "local_first").strip().lower()
+    if mode not in {"local_first", "local_only", "ai_only"}:
+        mode = "local_first"
+    if mode != "ai_only":
+        fast_start = time.perf_counter()
+        fast = _fast_local(message, categories, companies, today)
+        if fast is not None:
+            fast["latency_seconds"] = round(time.perf_counter() - fast_start, 4)
+            return fast
+        if mode == "local_only":
+            return {"intent":"unknown", "tasks":[], "extraction_method":"local_review",
+                    "latency_seconds":round(time.perf_counter() - fast_start, 4)}
+
     if demo_mode():
-        return _clean(_demo_extract(message, categories, today, companies), categories)
+        return _repair_obvious_fields(
+            _clean(_demo_extract(message, categories, today, companies), categories),
+            message, categories)
 
     model = model_name()
     system = _build_system(categories, companies, today, message)
     usage = {"model": model, "calls": 0, "input_tokens": 0,
              "output_tokens": 0, "cost_usd": None}
     last_error = None
+    started = time.perf_counter()
     try:
-        for _ in range(2):
-            # Intentionally avoid unverified 'thinking' extra_body settings.
+        # Parse retry is configurable; default to 1 call for minimal latency.
+        for _ in range(_config_int("AI_PARSE_ATTEMPTS", 1)):
             response = _get_client().messages.create(
                 model=model,
-                max_tokens=_config_int("AI_MAX_TOKENS", 4000),
+                max_tokens=_config_int("AI_MAX_TOKENS", 1800 if len(message) < 1000 else 3500),
                 system=system,
                 messages=[{"role": "user", "content": message}],
             )
@@ -472,9 +664,12 @@ def extract_tasks(message, categories, companies, today):
             if getattr(response, "stop_reason", None) == "max_tokens":
                 raise ValueError("AI response was truncated. Try a shorter instruction.")
             try:
-                result = _clean(_parse_json(_reply_text(response)), categories)
+                result = _repair_obvious_fields(
+                    _clean(_parse_json(_reply_text(response)), categories),
+                    message, categories)
                 # No new mandatory return fields: existing app.py and text_extract.py work.
                 result["usage"] = usage
+                result["latency_seconds"] = round(time.perf_counter() - started, 2)
                 return result
             except (ValueError, TypeError) as exc:
                 last_error = exc

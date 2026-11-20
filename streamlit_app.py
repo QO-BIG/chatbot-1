@@ -125,8 +125,12 @@ with tab_chat:
     if message:
         st.session_state.chat.append(("user", message))
         try:
+            # Each lookup opens the Excel workbook: read once per submission.
+            known_companies = db.get_companies()
+            known_categories = db.get_categories()
             result = extract.extract_tasks(
-                message, db.get_categories(), db.get_companies(), datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
+                message, known_categories, known_companies,
+                datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
             )
         except Exception as e:
             st.session_state.chat.append(("assistant", f"Sorry, extraction failed: {e}"))
@@ -145,26 +149,26 @@ with tab_chat:
                     ("assistant", "This looks like an update to an existing task. "
                                   "Updates are not built yet. Do not save this as a new task unless it is genuinely new.")
                 )
-        for t in tasks:
-            matched = db.resolve_company(
-                t.get("company"),
-                db.get_companies()
-            )
 
+        today = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
+        for t in tasks:
+            if not t.get("date_received"):
+                t["date_received"] = today
+            if "missing" in t:
+                t["missing"] = [m for m in t["missing"] if m != "date_received"]
+            matched = db.resolve_company(t.get("company"), known_companies)
             if matched:
                 t["company"] = matched
+
+        if tasks:
+            # One summary for the entire submission, not one per task.
             st.session_state.pending = tasks
             st.session_state.pending_raw = message
             st.session_state.pending_id += 1
-            counts = {}
-            for t in tasks:
-                name = t.get("company") or "(company not found)"
-                counts[name] = counts.get(name, 0) + 1
-            summary = ", ".join(f"{name} ({n})" for name, n in counts.items())
-            noun = "company" if len(counts) == 1 else "companies"
+            elapsed = result.get("latency_seconds")
+            timing = f" ({elapsed:.1f}s AI processing)" if isinstance(elapsed, (int, float)) else ""
             st.session_state.chat.append(
-                ("assistant", f"I found {len(tasks)} task(s) for {len(counts)} {noun}: {summary}. "
-                              "Please check below, edit if needed, then save.")
+                ("assistant", f"Found {len(tasks)} task(s). Review below.{timing}")
             )
         st.rerun()
 
@@ -183,7 +187,7 @@ with tab_chat:
                 df.at[i, "category"] = task["suggested_category"]
         df = df.astype(object).where(df.notna(), "")
 
-        st.caption("Date Received must be YYYY-MM-DD. It means when the instruction arrived, NOT its deadline. If missing, check the original email and enter the correct date before saving.")
+        st.caption("Date Received defaults to today if not specified. You can edit it before saving. Format: YYYY-MM-DD.")
         st.caption("Fee (RM) is optional. Leave it blank if the amount is unknown; 0 means explicitly no fee.")
 
         edited = st.data_editor(
