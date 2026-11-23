@@ -18,18 +18,10 @@ FILE = Path(os.getenv("COSEC_EXCEL_PATH", str(ROOT / "CoSec_Task_Management_Shee
 SHEETS = {
     "Companies": ["company_id", "company_name", "added_at"],
     "Categories": ["category_id", "category_name", "category_desc"],
-    "Tasks": ["task_id", "company_id", "category_id", "date_received", "raw_message", "created_by", "created_at", "fee_amount"],
+    "Tasks": ["task_id", "company", "category", "date_received", "raw_message", "created_by", "created_at", "fee_amount"],
     "Task_Counter": ["counter_date", "last_no"],
     "Audit_Log": ["task_id", "audit_id", "entry_no", "action_type", "old_value", "new_value", "audited_by", "audited_at"],
 }
-DEFAULT_CATEGORIES = [
-    "Company Incorporation", "Annual Return", "Financial Statements", "Change of Directors",
-    "Change of Shareholders", "Share Transfer", "Share Allotment", "Change of Company Name",
-    "Change of Registered Address", "Change of Business Address", "Company Constitution",
-    "Board Resolutions", "Shareholders' Resolutions", "Beneficial Ownership / BO Reporting",
-    "Company Charges", "Statutory Registers", "KYC / Client Due Diligence",
-    "Compliance / Regulatory Matters", "Corporate Advisory", "General Enquiries", "Others",
-]
 
 def _safe(value):
     # Avoid Excel interpreting untrusted message text as a formula or DDE link.
@@ -51,8 +43,6 @@ def _new_book():
         ws.append(headers)
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:{ws.cell(1,len(headers)).column_letter}1"
-    for i, name in enumerate(DEFAULT_CATEGORIES, 1):
-        wb["Categories"].append([i, name, None])
     return wb
 
 def _save(wb):
@@ -66,33 +56,59 @@ def _save(wb):
         if os.path.exists(temp):
             os.unlink(temp)
 
+OLD_TASK_HEADERS = ["task_id", "company_id", "category_id", "date_received", "raw_message", "created_by", "created_at", "fee_amount"]
+
+
+def migrate_task_names(wb):
+    """Convert old Tasks IDs into registered names, preserving all other cells/sheets.
+
+    Only handles the exact known old layout. Abort if any ID can't be resolved.
+    """
+    ws = wb["Tasks"]
+    actual = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
+    if actual == SHEETS["Tasks"]:
+        return False
+    if actual != OLD_TASK_HEADERS:
+        raise ValueError(f"Unexpected columns in Tasks: {actual}. Expected either old IDs or new names.")
+    companies = {r["company_id"]: r["company_name"] for r in _rows(wb["Companies"])}
+    categories = {r["category_id"]: r["category_name"] for r in _rows(wb["Categories"])}
+    conversions = []
+    for i in range(2, ws.max_row + 1):
+        if ws.cell(i, 1).value is None:
+            continue
+        cid, catid = ws.cell(i, 2).value, ws.cell(i, 3).value
+        if cid not in companies or catid not in categories:
+            raise ValueError(f"Tasks row {i}: unknown company_id={cid!r} or category_id={catid!r}; workbook not modified.")
+        conversions.append((i, companies[cid], categories[catid]))
+    for i, company, category in conversions:
+        ws.cell(i, 2, _safe(company))
+        ws.cell(i, 3, _safe(category))
+    ws.cell(1, 2, "company")
+    ws.cell(1, 3, "category")
+    return True
+
+
 def check_connection():
-    """Validate the local Excel file, creating it on first run."""
+    """Validate workbook; migrate old ID-based Tasks once, with a backup."""
     with FileLock(str(FILE) + ".lock", timeout=15):
         if not FILE.exists():
-            _save(_new_book())
-        wb = load_workbook(FILE, read_only=True, data_only=True)
+            raise FileNotFoundError(f"Workbook not found: {FILE}. Restore the workbook or set COSEC_EXCEL_PATH.")
+        wb = load_workbook(FILE)
         try:
             for name, headers in SHEETS.items():
                 if name not in wb.sheetnames:
-                    raise ValueError(f"Missing Excel sheet {name}. Back up and restore the workbook.")
-                actual = [cell.value for cell in next(wb[name].iter_rows(min_row=1,max_row=1))]
+                    raise ValueError(f"Missing Excel sheet {name}.")
+                ws = wb[name]
+                actual = [ws.cell(1, i).value for i in range(1, ws.max_column + 1)]
+                if name == "Tasks" and actual == OLD_TASK_HEADERS:
+                    continue
                 if actual != headers:
-                    # Migrate earlier workbooks in place; preserve existing task records.
-                    if name == "Tasks" and actual in (headers[:-1], headers[:-2]):
-                        wb.close()
-                        mutable = load_workbook(FILE)
-                        ws = mutable["Tasks"]
-                        for idx in range(len(actual), len(headers)):
-                            ws.cell(1, idx + 1, headers[idx])
-                        for row_idx in range(2, ws.max_row + 1):
-                            if not ws.cell(row_idx, 9).value:
-                                ws.cell(row_idx, 9, "Pending")
-                        _save(mutable)
-                        mutable.close()
-                        wb = load_workbook(FILE, read_only=True, data_only=True)
-                    else:
-                        raise ValueError(f"Unexpected columns in {name}; expected {headers}.")
+                    raise ValueError(f"Unexpected columns in {name}; found {actual}; expected {headers}.")
+            if migrate_task_names(wb):
+                backup = FILE.with_name(FILE.stem + "_before_name_migration.xlsx")
+                if not backup.exists():
+                    shutil.copy2(FILE, backup)
+                _save(wb)
         finally:
             wb.close()
     return True
@@ -189,32 +205,30 @@ def _timestamp(value):
 
 def list_tasks(company=None):
     with _book() as wb:
-        companies = {r["company_id"]: r["company_name"] for r in _rows(wb["Companies"])}
-        categories = {r["category_id"]: r["category_name"] for r in _rows(wb["Categories"])}
         records = []
         for r in _rows(wb["Tasks"]):
             task_id = r.get("task_id")
-
-            if task_id is None or str(task_id).strip().lower() in ("", "none", "null"):
+            if task_id is None or not str(task_id).strip():
                 continue
-            name = companies.get(r["company_id"])
+            name = r.get("company")
             if company and name != company:
                 continue
-            records.append({"task_id":r["task_id"], "company":name, "date_received":_date(r["date_received"]),
-                            "category":categories.get(r["category_id"]), "created_by":r["created_by"],
-                            "created_at":_timestamp(r["created_at"]), "fee_amount":r.get("fee_amount")})
+            records.append({"task_id":task_id, "company":name,
+                            "date_received":_date(r.get("date_received")),
+                            "category":r.get("category"), "created_by":r.get("created_by"),
+                            "created_at":_timestamp(r.get("created_at")),
+                            "fee_amount":r.get("fee_amount")})
         return sorted(records, key=lambda r: (r["date_received"] or date.min, str(r["task_id"] or "")), reverse=True)
+
 
 def get_task(task_id):
     with _book() as wb:
-        companies = {r["company_id"]: r["company_name"] for r in _rows(wb["Companies"])}
-        categories = {r["category_id"]: r["category_name"] for r in _rows(wb["Categories"])}
         for r in _rows(wb["Tasks"]):
             if r["task_id"] == task_id:
-                return {"task_id":task_id, "company":companies[r["company_id"]],
-                        "category":categories[r["category_id"]], "date_received":_date(r["date_received"]),
-                        "raw_message":r["raw_message"], "created_by":r["created_by"],
-                        "created_at":_timestamp(r["created_at"]), "fee_amount":r.get("fee_amount")}
+                return {"task_id":task_id, "company":r.get("company"),
+                        "category":r.get("category"), "date_received":_date(r.get("date_received")),
+                        "raw_message":r.get("raw_message"), "created_by":r.get("created_by"),
+                        "created_at":_timestamp(r.get("created_at")), "fee_amount":r.get("fee_amount")}
     raise ValueError(f"Task {task_id} was not found")
 
 def get_audit(task_id):
@@ -255,7 +269,71 @@ def _optional_fee(value):
     return float(number)
 
 
-def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_new_categories=False):
+# ---------- duplicate detection ----------
+def _dup_key(company, category, received):
+    # Punctuation and whitespace differences in a registered company should not
+    # hide a duplicate. Categories compare case-insensitively.
+    return (
+        company_base(company),
+        " ".join(str(category or "").casefold().split()),
+        _to_date(received, "date_received").isoformat(),
+    )
+
+
+def _source_key(value):
+    # This is intentionally conservative: semantically similar but differently
+    # worded instructions are *possible* duplicates, not confirmed duplicates.
+    return " ".join(str(value or "").casefold().split())
+
+
+def _find_duplicates_in_workbook(wb, tasks, raw_message):
+    """Return potential duplicates in Excel and within the incoming batch.
+
+    The match is per company + category + received date. Matching source text
+    further identifies an exact repeated submission. Does not modify workbook.
+    """
+    existing = {}
+    for row in _rows(wb["Tasks"]):
+        if not row.get("task_id") or not row.get("company") or not row.get("category") or not row.get("date_received"):
+            continue
+        key = _dup_key(row["company"], row["category"], row["date_received"])
+        existing.setdefault(key, []).append(row)
+
+    seen_batch = {}
+    matches = []
+    for index, task in enumerate(tasks, 1):
+        name, cat, received = task.get("company"), task.get("category"), task.get("date_received")
+        if not name or not cat or not received:
+            continue
+        key = _dup_key(name, cat, received)
+        for old in existing.get(key, []):
+            exact = _source_key(old.get("raw_message")) == _source_key(raw_message)
+            matches.append({
+                "row": index,
+                "company": str(name), "category": str(cat),
+                "date_received": key[2], "task_id": str(old["task_id"]),
+                "kind": "exact" if exact else "possible",
+                "source": "existing",
+            })
+        if key in seen_batch:
+            matches.append({
+                "row": index, "company": str(name), "category": str(cat),
+                "date_received": key[2], "task_id": None,
+                "kind": "exact", "source": "batch",
+                "first_row": seen_batch[key],
+            })
+        else:
+            seen_batch[key] = index
+    return matches
+
+
+def find_duplicate_tasks(tasks, raw_message):
+    """Read-only preview for the confirmation screen."""
+    with _book() as wb:
+        return _find_duplicates_in_workbook(wb, tasks, raw_message)
+
+
+def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_new_categories=False, allow_duplicates=False):
     """Save all tasks atomically; validation failure leaves workbook unchanged."""
     if not str(user).strip():
         raise ValueError("Uploader name is required.")
@@ -274,6 +352,17 @@ def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_
         new_companies, created = {}, []
         staged = []
         new_categories = {}
+        # The final duplicate check happens inside the same write lock as
+        # insertion, so simultaneous users cannot bypass the preview check.
+        duplicates = _find_duplicates_in_workbook(wb, tasks, raw_message)
+        if duplicates and not allow_duplicates:
+            summary = "; ".join(
+                f"row {d['row']} ({d['company']} / {d['category']}, {d['date_received']})"
+                + (f" matches task {d['task_id']}" if d['task_id'] else f" repeats row {d['first_row']}")
+                for d in duplicates[:5]
+            )
+            raise ValueError("Possible duplicate task(s) detected: " + summary
+                             + ". Review existing records or explicitly confirm 'Save duplicates anyway'.")
         # These approvals are explicit confirmation-screen choices, not AI decisions.
         for t in tasks:
             name = str(t.get("company") or "").strip()
@@ -329,7 +418,7 @@ def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_
         for cat in new_categories.values():
             wb["Categories"].append([cat["category_id"], _safe(cat["category_name"]), None])
         for tid,comp,cat,received,fee_amount in staged:
-            wb["Tasks"].append([tid, comp["company_id"], cat["category_id"], received,
+            wb["Tasks"].append([tid, _safe(comp["company_name"]), _safe(cat["category_name"]), received,
                                 _safe(raw_message), _safe(user.strip()), now, fee_amount])
             wb["Tasks"].cell(wb["Tasks"].max_row, 8).number_format = '"RM "#,##0.00' 
             snapshot = {"company":comp["company_name"], "category":cat["category_name"],
@@ -363,8 +452,6 @@ def update_task(task_id, changes, user, note="", expected=None):
         ws = wb["Tasks"]
         companies = {str(r["company_name"]).strip().casefold(): r for r in _rows(wb["Companies"])}
         categories = {str(r["category_name"]).strip().casefold(): r for r in _rows(wb["Categories"])}
-        companies_by_id = {r["company_id"]: r["company_name"] for r in _rows(wb["Companies"])}
-        categories_by_id = {r["category_id"]: r["category_name"] for r in _rows(wb["Categories"])}
         found_row = None
         for row_num in range(2, ws.max_row + 1):
             if str(ws.cell(row_num, 1).value) == str(task_id):
@@ -374,11 +461,10 @@ def update_task(task_id, changes, user, note="", expected=None):
             raise ValueError(f"Task {task_id} was not found.")
         row = found_row
         original = {
-            "company": companies_by_id[ws.cell(row, 2).value],
-            "category": categories_by_id[ws.cell(row, 3).value],
+            "company": ws.cell(row, 2).value,
+            "category": ws.cell(row, 3).value,
             "date_received": _date(ws.cell(row, 4).value).isoformat(),
             "fee_amount": ws.cell(row, 8).value,
-            "status": ws.cell(row, 9).value or "Pending",
         }
         if expected is not None:
             old_expected = dict(expected)
@@ -408,13 +494,13 @@ def update_task(task_id, changes, user, note="", expected=None):
         if not changed_keys and not note:
             raise ValueError("Change a field or enter an update note before saving.")
         if "company" in changed_keys:
-            ws.cell(row, 2, companies[updated["company"].casefold()]["company_id"])
+            ws.cell(row, 2, _safe(updated["company"]))
         if "category" in changed_keys:
-            ws.cell(row, 3, categories[updated["category"].casefold()]["category_id"])
+            ws.cell(row, 3, _safe(updated["category"]))
         if "date_received" in changed_keys:
             ws.cell(row, 4, _to_date(updated["date_received"], "date_received"))
         if "fee_amount" in changed_keys:
-            ws.cell(row, 8, updated["fee_amount"])
+            ws.cell(row, 8).value = updated["fee_amount"]
         # Append a full before/after snapshot so the history is understandable.
         old_snapshot = dict(original)
         new_snapshot = dict(updated)

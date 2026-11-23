@@ -125,12 +125,8 @@ with tab_chat:
     if message:
         st.session_state.chat.append(("user", message))
         try:
-            # Each lookup opens the Excel workbook: read once per submission.
-            known_companies = db.get_companies()
-            known_categories = db.get_categories()
             result = extract.extract_tasks(
-                message, known_categories, known_companies,
-                datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
+                message, db.get_categories(), db.get_companies(), datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
             )
         except Exception as e:
             st.session_state.chat.append(("assistant", f"Sorry, extraction failed: {e}"))
@@ -150,26 +146,26 @@ with tab_chat:
                                   "Updates are not built yet. Do not save this as a new task unless it is genuinely new.")
                 )
 
-        today = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
-        for t in tasks:
-            if not t.get("date_received"):
-                t["date_received"] = today
-            if "missing" in t:
-                t["missing"] = [m for m in t["missing"] if m != "date_received"]
-            matched = db.resolve_company(t.get("company"), known_companies)
-            if matched:
-                t["company"] = matched
-
-        if tasks:
-            # One summary for the entire submission, not one per task.
+            today = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
+            explicit_review = bool(result.get("review_reasons"))
+            for task in tasks:
+                # Only fill today for a genuinely absent date, not one which
+                # was explicitly ambiguous or invalid in the original message.
+                if not task.get("date_received") and not explicit_review:
+                    task["date_received"] = today
+                    task["date_defaulted"] = True
+                    task["missing"] = [m for m in task.get("missing", []) if m != "date_received"]
+                matched = db.resolve_company(task.get("company"), db.get_companies())
+                if matched:
+                    task["company"] = matched
             st.session_state.pending = tasks
             st.session_state.pending_raw = message
+            st.session_state.pending_review_reasons = result.get("review_reasons", [])
+            st.session_state.pending_intent = result.get("intent")
             st.session_state.pending_id += 1
-            elapsed = result.get("latency_seconds")
-            timing = f" ({elapsed:.1f}s AI processing)" if isinstance(elapsed, (int, float)) else ""
-            st.session_state.chat.append(
-                ("assistant", f"Found {len(tasks)} task(s). Review below.{timing}")
-            )
+            method = result.get("extraction_method", "AI")
+            duration = result.get("latency_seconds", 0)
+            st.session_state.chat.append(("assistant", f"Found {len(tasks)} task(s) using {method} ({duration}s). Review below."))
         st.rerun()
 
     # ---------- confirmation card ----------
@@ -181,13 +177,15 @@ with tab_chat:
         if missing:
             st.warning("Could not find: " + ", ".join(missing) + ". Please fill in or confirm.")
 
+        for reason in st.session_state.get("pending_review_reasons", []):
+            st.warning("Needs review: " + str(reason))
         df = pd.DataFrame(tasks).reindex(columns=COLUMNS)
         for i, task in enumerate(tasks):
             if not df.at[i, "category"] and task.get("suggested_category"):
                 df.at[i, "category"] = task["suggested_category"]
         df = df.astype(object).where(df.notna(), "")
 
-        st.caption("Date Received defaults to today if not specified. You can edit it before saving. Format: YYYY-MM-DD.")
+        st.caption("Date Received defaults to today only when no date is provided and no ambiguity was detected. Review before saving. Format: YYYY-MM-DD.")
         st.caption("Fee (RM) is optional. Leave it blank if the amount is unknown; 0 means explicitly no fee.")
 
         edited = st.data_editor(
@@ -280,6 +278,35 @@ with tab_chat:
                                        disabled=not bool(unknown_categories), key=f"approve_categories_{st.session_state.pending_id}")
         st.caption("Approval here is by the person recording the task. It is not owner-role authentication.")
 
+        # Preview possible duplicate rows before committing. The database checks
+        # again inside its write lock to protect against concurrent submissions.
+        preview_rows = []
+        for r in current_rows:
+            preview_rows.append({
+                "company": clean(r.get("company")),
+                "category": clean(r.get("category")),
+                "date_received": clean(r.get("date_received")),
+            })
+        duplicate_preview = []
+        try:
+            duplicate_preview = db.find_duplicate_tasks(preview_rows, st.session_state.pending_raw)
+        except ValueError:
+            # Let the normal date validation show the precise error on save.
+            pass
+        if duplicate_preview:
+            st.warning(f"⚠️ Found {len(duplicate_preview)} possible duplicate match(es). Review before saving.")
+            for dup in duplicate_preview[:15]:
+                counterpart = (f"existing task {dup['task_id']}"
+                               if dup['task_id'] else f"another submitted row {dup['first_row']}")
+                st.caption(f"Row {dup['row']}: {dup['company']} — {dup['category']} "
+                           f"({dup['date_received']}) matches {counterpart} "
+                           f"[{dup['kind']}].")
+        allow_duplicates = st.checkbox(
+            "I checked these possible duplicates and confirm they are separate tasks; save anyway",
+            value=False, disabled=not bool(duplicate_preview),
+            key=f"allow_duplicates_{st.session_state.pending_id}",
+        )
+
         col1, col2 = st.columns(2)
         if col1.button("Save to Excel", type="primary"):
             if not user.strip():
@@ -307,7 +334,11 @@ with tab_chat:
                     rows.append(item)
                 bad = [i + 1 for i, r in enumerate(rows)
                        if not (r.get("company") and r.get("category") and r.get("date_received"))]
-                if unresolved_others:
+                if st.session_state.get("pending_intent") == "update":
+                    st.error("This is an existing-task update. Use the Update Tasks tab, not Add Tasks.")
+                elif duplicate_preview and not allow_duplicates:
+                    st.error("Potential duplicate found. Review the existing task(s) and confirm only if this is genuinely separate work.")
+                elif unresolved_others:
                     st.error(f"Please decide whether to keep 'Others' or add a new category for row(s) {unresolved_others}.")
                 elif bad:
                     st.error(f"Row(s) {bad} are missing the company, category or date received.")
@@ -319,7 +350,8 @@ with tab_chat:
                     try:
                         saved_ids = db.insert_tasks(rows, st.session_state.pending_raw, user.strip(),
                                                     approve_new_companies=allow_companies,
-                                                    approve_new_categories=allow_categories)
+                                                    approve_new_categories=allow_categories,
+                                                    allow_duplicates=allow_duplicates)
                     except ValueError as e:
                         st.error(str(e))          # e.g. a date typed in the wrong format
                     except Exception as e:
