@@ -147,17 +147,22 @@ with tab_chat:
                 )
 
             today = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).date().isoformat()
-            explicit_review = bool(result.get("review_reasons"))
-            for task in tasks:
-                # Only fill today for a genuinely absent date, not one which
-                # was explicitly ambiguous or invalid in the original message.
-                if not task.get("date_received") and not explicit_review:
-                    task["date_received"] = today
-                    task["date_defaulted"] = True
-                    task["missing"] = [m for m in task.get("missing", []) if m != "date_received"]
-                matched = db.resolve_company(task.get("company"), db.get_companies())
+            known_companies = db.get_companies()
+            # Date defaults are evaluated per task, independent of company warnings.
+            date_review = []
+            review_reasons = result.get("review_reasons", [])
+            for idx, task in enumerate(tasks):
+                if not task.get("date_received"):
+                    if extract.should_default_received_date(task, message, review_reasons):
+                        task["date_received"] = today
+                        task["date_defaulted"] = True
+                        task["missing"] = [m for m in task.get("missing", []) if m != "date_received"]
+                    else:
+                        date_review.append(f"Row {idx + 1}: Check the instruction received date.")
+                matched = db.resolve_company(task.get("company"), known_companies)
                 if matched:
                     task["company"] = matched
+            st.session_state.pending_date_review = date_review
             st.session_state.pending = tasks
             st.session_state.pending_raw = message
             st.session_state.pending_review_reasons = result.get("review_reasons", [])
@@ -177,8 +182,12 @@ with tab_chat:
         if missing:
             st.warning("Could not find: " + ", ".join(missing) + ". Please fill in or confirm.")
 
-        for reason in st.session_state.get("pending_review_reasons", []):
-            st.warning("Needs review: " + str(reason))
+        all_reasons = list(dict.fromkeys(
+            str(x) for x in (st.session_state.get("pending_review_reasons", []) +
+                             st.session_state.get("pending_date_review", [])) if str(x).strip()
+        ))
+        if all_reasons:
+            st.warning("Needs review:\n" + "\n".join("- " + reason for reason in all_reasons))
         df = pd.DataFrame(tasks).reindex(columns=COLUMNS)
         for i, task in enumerate(tasks):
             if not df.at[i, "category"] and task.get("suggested_category"):
@@ -477,3 +486,4 @@ with tab_records:
 
     else:
         st.info("No tasks found.")
+
