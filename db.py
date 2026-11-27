@@ -20,7 +20,7 @@ SHEETS = {
     "Categories": ["category_id", "category_name", "category_desc"],
     "Tasks": ["task_id", "company", "category", "date_received", "raw_message", "created_by", "created_at", "fee_amount"],
     "Task_Counter": ["counter_date", "last_no"],
-    "Audit_Log": ["task_id", "audit_id", "entry_no", "action_type", "old_value", "new_value", "audited_by", "audited_at"],
+    "Audit_Log": ["task_id", "entry_no", "action_type", "old_value", "new_value", "audited_by", "audited_at"],
 }
 
 def _safe(value):
@@ -35,16 +35,6 @@ def _rows(ws):
         return []
     return [dict(zip(rows[0], row)) for row in rows[1:] if any(v is not None for v in row)]
 
-def _new_book():
-    wb = Workbook()
-    wb.remove(wb.active)
-    for name, headers in SHEETS.items():
-        ws = wb.create_sheet(name)
-        ws.append(headers)
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{ws.cell(1,len(headers)).column_letter}1"
-    return wb
-
 def _save(wb):
     FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(suffix=".xlsx", dir=FILE.parent)
@@ -56,62 +46,49 @@ def _save(wb):
         if os.path.exists(temp):
             os.unlink(temp)
 
-OLD_TASK_HEADERS = ["task_id", "company_id", "category_id", "date_received", "raw_message", "created_by", "created_at", "fee_amount"]
-
-
-def migrate_task_names(wb):
-    """Convert old Tasks IDs into registered names, preserving all other cells/sheets.
-
-    Only handles the exact known old layout. Abort if any ID can't be resolved.
-    """
-    ws = wb["Tasks"]
-    actual = [ws.cell(1, col).value for col in range(1, ws.max_column + 1)]
-    if actual == SHEETS["Tasks"]:
-        return False
-    if actual != OLD_TASK_HEADERS:
-        raise ValueError(f"Unexpected columns in Tasks: {actual}. Expected either old IDs or new names.")
-    companies = {r["company_id"]: r["company_name"] for r in _rows(wb["Companies"])}
-    categories = {r["category_id"]: r["category_name"] for r in _rows(wb["Categories"])}
-    conversions = []
-    for i in range(2, ws.max_row + 1):
-        if ws.cell(i, 1).value is None:
-            continue
-        cid, catid = ws.cell(i, 2).value, ws.cell(i, 3).value
-        if cid not in companies or catid not in categories:
-            raise ValueError(f"Tasks row {i}: unknown company_id={cid!r} or category_id={catid!r}; workbook not modified.")
-        conversions.append((i, companies[cid], categories[catid]))
-    for i, company, category in conversions:
-        ws.cell(i, 2, _safe(company))
-        ws.cell(i, 3, _safe(category))
-    ws.cell(1, 2, "company")
-    ws.cell(1, 3, "category")
-    return True
-
 
 def check_connection():
-    """Validate workbook; migrate old ID-based Tasks once, with a backup."""
+    """Validate workbook headers, ignoring completely empty trailing columns."""
     with FileLock(str(FILE) + ".lock", timeout=15):
         if not FILE.exists():
-            raise FileNotFoundError(f"Workbook not found: {FILE}. Restore the workbook or set COSEC_EXCEL_PATH.")
+            raise FileNotFoundError(
+                f"Workbook not found: {FILE}. "
+                "Restore the workbook or set COSEC_EXCEL_PATH."
+            )
+
         wb = load_workbook(FILE)
         try:
             for name, headers in SHEETS.items():
                 if name not in wb.sheetnames:
                     raise ValueError(f"Missing Excel sheet {name}.")
+
                 ws = wb[name]
-                actual = [ws.cell(1, i).value for i in range(1, ws.max_column + 1)]
-                if name == "Tasks" and actual == OLD_TASK_HEADERS:
-                    continue
+
+                # Check only the columns defined in SHEETS
+                actual = [
+                    ws.cell(1, i).value
+                    for i in range(1, len(headers) + 1)
+                ]
+
                 if actual != headers:
-                    raise ValueError(f"Unexpected columns in {name}; found {actual}; expected {headers}.")
-            if migrate_task_names(wb):
-                backup = FILE.with_name(FILE.stem + "_before_name_migration.xlsx")
-                if not backup.exists():
-                    shutil.copy2(FILE, backup)
-                _save(wb)
+                    raise ValueError(
+                        f"Unexpected columns in {name}; "
+                        f"found {actual}; expected {headers}."
+                    )
+
+                # Reject extra columns if they contain actual data
+                for col in range(len(headers) + 1, ws.max_column + 1):
+                    for row in range(1, ws.max_row + 1):
+                        if ws.cell(row, col).value is not None:
+                            raise ValueError(
+                                f"Unexpected data in {name}, "
+                                f"row {row}, column {col}."
+                            )
         finally:
             wb.close()
+
     return True
+
 
 @contextmanager
 def _book(write=False):
@@ -236,7 +213,7 @@ def get_audit(task_id):
         result = []
         for r in _rows(wb["Audit_Log"]):
             if r["task_id"] == task_id:
-                result.append({"audit_id":r["audit_id"], "entry_no":int(r["entry_no"]),
+                result.append({"entry_no":int(r["entry_no"]),
                                "action_type":r["action_type"],
                                "old_value":json.loads(r["old_value"]) if r["old_value"] else None,
                                "new_value":json.loads(r["new_value"]), "audited_by":r["audited_by"],
@@ -418,12 +395,22 @@ def insert_tasks(tasks, raw_message, user, approve_new_companies=False, approve_
         for cat in new_categories.values():
             wb["Categories"].append([cat["category_id"], _safe(cat["category_name"]), None])
         for tid,comp,cat,received,fee_amount in staged:
-            wb["Tasks"].append([tid, _safe(comp["company_name"]), _safe(cat["category_name"]), received,
-                                _safe(raw_message), _safe(user.strip()), now, fee_amount])
-            wb["Tasks"].cell(wb["Tasks"].max_row, 8).number_format = '"RM "#,##0.00' 
+            task_ws = wb["Tasks"]
+            # Preformatted workbook templates can contain 1,000 empty task rows.
+            # Excel append() would place the new record after those empty rows.
+            target_row = next(
+                (i for i in range(2, task_ws.max_row + 1)
+                 if all(task_ws.cell(i, c).value is None for c in range(1, 9))),
+                task_ws.max_row + 1,
+            )
+            values = [tid, _safe(comp["company_name"]), _safe(cat["category_name"]), received,
+                      _safe(raw_message), _safe(user.strip()), now, fee_amount]
+            for col, value in enumerate(values, 1):
+                task_ws.cell(target_row, col).value = value
+            task_ws.cell(target_row, 8).number_format = '"RM "#,##0.00' 
             snapshot = {"company":comp["company_name"], "category":cat["category_name"],
                         "date_received":received.isoformat(), "fee_amount":fee_amount}
-            wb["Audit_Log"].append([tid,"A"+tid[1:],1,"CREATE",None,
+            wb["Audit_Log"].append([tid,1,"CREATE",None,
                                     json.dumps(snapshot,ensure_ascii=False),_safe(user.strip()),now])
         # Rewrite counter sheet in memory; no disk change until all stages succeed.
         ws=wb["Task_Counter"]
@@ -510,7 +497,7 @@ def update_task(task_id, changes, user, note="", expected=None):
         entry_no = max(entries, default=0) + 1
         now = datetime.now(ZoneInfo("Asia/Kuala_Lumpur")).replace(tzinfo=None)
         wb["Audit_Log"].append([
-            task_id, "A" + str(task_id)[1:], entry_no, "UPDATE",
+            task_id, entry_no, "UPDATE",
             json.dumps(old_snapshot, ensure_ascii=False),
             json.dumps(new_snapshot, ensure_ascii=False),
             _safe(user.strip()), now,

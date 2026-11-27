@@ -84,8 +84,6 @@ def show_task(task_id):
             st.text(task["raw_message"])
 
     entries = db.get_audit(task_id)
-    audit_id = entries[0]["audit_id"] if entries else "A" + task_id[1:]
-    st.markdown(f"##### Audit log `{audit_id}`")
     for e in entries:
         with st.container(border=True):
             left, right = st.columns([1, 6])
